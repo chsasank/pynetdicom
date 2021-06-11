@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 import logging
 from ssl import SSLContext
-import threading
+import asyncio
 from typing import Union, Optional, List, Tuple, Callable, Any
 
 from pydicom.uid import UID
@@ -14,7 +14,7 @@ from pynetdicom.association import Association
 from pynetdicom.events import EventHandlerType
 from pynetdicom.presentation import PresentationContext
 from pynetdicom.transport import (
-    AssociationSocket, AssociationServer, ThreadedAssociationServer
+    AssociationStream, AssociationServer
 )
 from pynetdicom.utils import make_target, validate_ae_title
 from pynetdicom._globals import (
@@ -58,6 +58,8 @@ class ApplicationEntity:
         # {abstract_syntax : PresentationContext}
         self._supported_contexts = {}
 
+        self._servers = []
+
         # Default maximum simultaneous associations
         self.maximum_associations = 10
 
@@ -74,8 +76,7 @@ class ApplicationEntity:
         self.require_calling_aet = []
         self.require_called_aet = False
 
-        self._servers = []
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
     @property
     def acse_timeout(self) -> Union[int, float, None]:
@@ -116,10 +117,13 @@ class ApplicationEntity:
             A list of all active association threads, both requestors and
             acceptors.
         """
-        threads = threading.enumerate()
-        t_assocs = [tt for tt in threads if isinstance(tt, Association)]
-
-        return [tt for tt in t_assocs if tt.ae == self]
+        acceptor_associations = [
+            assoc for server in self._servers for assoc in server.active_associations
+            if assoc.ae == self
+        ]
+        # TODO: requester_associations
+        
+        return acceptor_associations
 
     def add_requested_context(
         self,
@@ -572,15 +576,16 @@ class ApplicationEntity:
 
         return assoc
 
-    def _create_socket(self, assoc, address, tls_args) -> AssociationSocket:
-        """Create an :class:`~pynetdicom.transport.AssociationSocket` for the
+    async def _create_stream(self, assoc, address, tls_args) -> AssociationStream:
+        """Create an :class:`~pynetdicom.transport.AssociationStream` for the
         current association.
 
         .. versionadded:: 1.5
         """
-        sock = AssociationSocket(assoc, address=address)
-        sock.tls_args = tls_args or {}
-        return sock
+        reader, writer = await asyncio.open_connection(*address)
+        stream = AssociationStream(assoc, reader, writer)
+        stream.tls_args = tls_args or {}
+        return stream
 
     @property
     def connection_timeout(self) -> Union[int, float, None]:
@@ -1224,7 +1229,7 @@ class ApplicationEntity:
 
         self._servers = []
 
-    def start_server(
+    async def start_server(
         self,
         address: Tuple[str, int],
         block: bool = True,
@@ -1232,7 +1237,7 @@ class ApplicationEntity:
         evt_handlers: Optional[EventHandlerType] = None,
         ae_title: Optional[bytes] = None,
         contexts: Optional[List[PresentationContext]] = None
-    ) -> Optional[ThreadedAssociationServer]:
+    ):
         """Start the AE as an association *acceptor*.
 
         .. versionadded:: 1.2
@@ -1304,7 +1309,7 @@ class ApplicationEntity:
 
             try:
                 # **BLOCKING**
-                server.serve_forever()
+                await server.serve_forever()
             except KeyboardInterrupt:
                 server.shutdown()
         else:

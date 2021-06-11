@@ -153,7 +153,7 @@ def handle_echo(event):
     return 0x0000
 
 
-def main(args=None):
+async def main(args=None):
     """Run the application."""
     if args is not None:
         sys.argv = args
@@ -193,8 +193,9 @@ def main(args=None):
     ae.acse_timeout = args.acse_timeout
     ae.dimse_timeout = args.dimse_timeout
 
-    ae.start_server((args.bind_address, args.port), evt_handlers=handlers)
+    await ae.start_server((args.bind_address, args.port), evt_handlers=handlers)
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

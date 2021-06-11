@@ -2,8 +2,8 @@
 Implements the DICOM Upper Layer service provider.
 """
 
+import asyncio
 import logging
-import queue
 import socket
 from struct import unpack
 import struct
@@ -26,17 +26,16 @@ from pynetdicom.utils import make_target
 LOGGER = logging.getLogger('pynetdicom.dul')
 
 
-class DULServiceProvider(Thread):
+class DULServiceProvider:
     """The DICOM Upper Layer Service Provider.
 
     Attributes
     ----------
     artim_timer : timer.Timer
         The :dcm:`ARTIM<part08/chapter_9.html#sect_9.1.5>` timer.
-    socket : transport.AssociationSocket
-        A wrapped `socket
-        <https://docs.python.org/3/library/socket.html#socket-objects>`_
-        object used to communicate with the peer.
+    stream : transport.AssociationStream
+        A wrapped asyncio.StreamReader and asyncio.StreamWriter
+        objects used to communicate with the peer.
     to_provider_queue : queue.Queue
         Queue of PDUs from the DUL service user to be processed by the DUL
         provider.
@@ -59,7 +58,7 @@ class DULServiceProvider(Thread):
         """
         # The association thread
         self._assoc = assoc
-        self.socket = None
+        self.stream = None
 
         # Current primitive and PDU
         # TODO: Don't do it this way
@@ -67,15 +66,15 @@ class DULServiceProvider(Thread):
         self.pdu = None
 
         # Tracks the events the state machine needs to process
-        self.event_queue = queue.Queue()
+        self.event_queue = asyncio.Queue()
         # These queues provide communication between the DUL service
         #   user and the DUL service provider.
         # An event occurs when the DUL service user adds to
         #   the to_provider_queue
-        self.to_provider_queue = queue.Queue()
+        self.to_provider_queue = asyncio.Queue()
         # A primitive is sent to the service user when the DUL service provider
         # adds to the to_user_queue.
-        self.to_user_queue = queue.Queue()
+        self.to_user_queue = asyncio.Queue()
 
         # Set the (network) idle and ARTIM timers
         # Timeouts gets set after DUL init so these are temporary
@@ -89,9 +88,10 @@ class DULServiceProvider(Thread):
         # TODO: try and make this event based rather than running loops
         self._run_loop_delay = 0.001
 
-        Thread.__init__(self, target=make_target(self.run_reactor))
-        self.daemon = False
         self._kill_thread = False
+
+    def start(self):
+        return asyncio.create_task(self.run_reactor())
 
     @property
     def assoc(self):
@@ -103,10 +103,10 @@ class DULServiceProvider(Thread):
         try:
             # Check the queue and see if there are any primitives
             # If so then put the corresponding event on the event queue
-            self.primitive = self.to_provider_queue.get(False)
-            self.event_queue.put(self._primitive_to_event(self.primitive))
+            self.primitive = self.to_provider_queue.get_nowait()
+            self.event_queue.put_nowait(self._primitive_to_event(self.primitive))
             return True
-        except queue.Empty:
+        except asyncio.QueueEmpty:
             return False
 
     def _decode_pdu(self, bytestream):
@@ -154,14 +154,14 @@ class DULServiceProvider(Thread):
         if self.state_machine.current_state == 'Sta13':
             # Check to see if there's more data to be read
             #   Might be any incoming PDU or valid/invalid data
-            if self.socket and self.socket.ready:
+            if self.stream and self.stream.ready:
                 # Data still available, grab it
                 self._read_pdu_data()
                 return True
 
             # Once we have no more incoming data close the socket and
             #   add the corresponding event to the queue
-            self.socket.close()
+            self.stream.close()
 
             return True
 
@@ -170,7 +170,7 @@ class DULServiceProvider(Thread):
         #   type
         # Fix for #28 - caused by peer disconnecting before run loop is
         #   stopped by assoc.release()
-        if self.socket and self.socket.ready:
+        if self.stream and self.stream.ready:
             self._read_pdu_data()
             return True
 
@@ -188,8 +188,10 @@ class DULServiceProvider(Thread):
     def peek_next_pdu(self):
         """Check the next PDU to be processed."""
         try:
-            return self.to_user_queue.queue[0]
-        except (queue.Empty, IndexError):
+            # TODO: not a good idea in asyncio queue probably
+            # because we're using undocumented var
+            return self.to_user_queue._queue[0]
+        except (asyncio.QueueEmpty, IndexError):
             return None
 
     @staticmethod
@@ -233,7 +235,7 @@ class DULServiceProvider(Thread):
 
         return event_str
 
-    def _read_pdu_data(self):
+    async def _read_pdu_data(self):
         """Read PDU data sent by the peer from the socket.
 
         Receives the PDU, attempts to decode it, places the corresponding
@@ -258,7 +260,7 @@ class DULServiceProvider(Thread):
 
         # Try and read the PDU type and length from the socket
         try:
-            bytestream.extend(self.socket.recv(6))
+            bytestream.extend(await self.stream.recv(6))
         except (socket.error, socket.timeout):
             # Evt17: Transport connection closed
             self.event_queue.put('Evt17')
@@ -283,7 +285,7 @@ class DULServiceProvider(Thread):
 
         # Try and read the rest of the PDU
         try:
-            bytestream += self.socket.recv(pdu_length)
+            bytestream += await self.stream.recv(pdu_length)
         except (socket.error, socket.timeout):
             # Evt17: Transport connection closed
             self.event_queue.put('Evt17')
@@ -309,7 +311,7 @@ class DULServiceProvider(Thread):
         self.pdu = pdu
         self.primitive = self.pdu.to_primitive()
 
-    def receive_pdu(self, wait=False, timeout=None):
+    async def receive_pdu(self, wait=False, timeout=None):
         """Return an item from the queue if one is available.
 
         Get the next item to be processed out of the queue of items sent
@@ -339,7 +341,13 @@ class DULServiceProvider(Thread):
             #   raises queue.Empty if no item was available in that time.
             # If block is False, return an item if one is immediately
             #   available, otherwise raise queue.Empty
-            queue_item = self.to_user_queue.get(block=wait, timeout=timeout)
+            if wait:
+                queue_item = await asyncio.wait_for(
+                    self.to_user_queue.get(),
+                    timeout=timeout
+                )
+            else:
+                queue_item = self.to_user_queue.get_nowait()
 
             # Event handler - ACSE received primitive from DUL service
             acse_primitives = (A_ASSOCIATE, A_RELEASE, A_ABORT, A_P_ABORT)
@@ -349,15 +357,14 @@ class DULServiceProvider(Thread):
                 )
 
             return queue_item
-        except queue.Empty:
+        except(asyncio.QueueEmpty, asyncio.TimeoutError):
             return None
 
-    def run_reactor(self):
+    async def run_reactor(self):
         """Run the DUL reactor.
 
-        The main :class:`threading.Thread` run loop. Runs constantly, checking
-        the connection for incoming data. When incoming data is received it
-        categorises it and add its to the
+        The main run loop. Runs constantly, checking the connection for incoming data. 
+        When incoming data is received it categorises it and add its to the
         :attr:`~DULServiceProvider.to_user_queue`.
         """
         # Main DUL loop
@@ -367,9 +374,6 @@ class DULServiceProvider(Thread):
             # Let the assoc reactor off the leash
             if not self.assoc._dul_ready.is_set():
                 self.assoc._dul_ready.set()
-
-            # This effectively controls how quickly the DUL does anything
-            time.sleep(self._run_loop_delay)
 
             if self._kill_thread:
                 break
@@ -397,7 +401,7 @@ class DULServiceProvider(Thread):
                 abort_pdu = A_ABORT_RQ()
                 abort_pdu.source = 0x02
                 abort_pdu.reason_diagnostic = 0x00
-                self.socket.send(abort_pdu.encode())
+                self.stream.send(abort_pdu.encode())
                 self.assoc.is_aborted = True
                 self.assoc.is_established = False
                 # Hard shutdown of the Association and DUL reactors
@@ -440,7 +444,7 @@ class DULServiceProvider(Thread):
                 self.assoc, evt.EVT_ACSE_SENT, {'primitive' : primitive}
             )
 
-        self.to_provider_queue.put(primitive)
+        self.to_provider_queue.put_nowait(primitive)
 
     def stop_dul(self):
         """Stop the reactor if current state is ``'Sta1'``

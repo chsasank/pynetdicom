@@ -1,11 +1,11 @@
 """
 Defines the Association class which handles associating with peers.
 """
+import asyncio
 from io import BytesIO
 import logging
 import os
 from pathlib import Path
-import threading
 import time
 from typing import Union, Optional, List, Callable, Any, Dict, Iterable, Tuple
 
@@ -57,7 +57,7 @@ from pynetdicom.utils import make_target
 LOGGER = logging.getLogger('pynetdicom.assoc')
 
 
-class Association(threading.Thread):
+class Association():
     """Manage an Association with a peer AE.
 
     Attributes
@@ -140,17 +140,17 @@ class Association(threading.Thread):
         # Flag for whether or not the DUL thread has been started
         self._started_dul = False
         # Used to pause the association reactor until the DUL is ready
-        self._dul_ready = threading.Event()
+        self._dul_ready = asyncio.Event()
         # Used to pause the association reactor while a service is being used
-        self._reactor_checkpoint = threading.Event()
+        self._reactor_checkpoint = asyncio.Event()
         self._reactor_checkpoint.set()
         # Used to ensure the reactor is paused before DIMSE messaging
         self._is_paused = False
 
-        # Thread setup
-        threading.Thread.__init__(self, target=make_target(self.run_reactor))
-        self.daemon = True
+    def start(self):
+        return asyncio.create_task(self.run_reactor())
 
+    # TODO: kill becomes async
     def abort(self) -> None:
         """Abort the :class:`Association` by sending an A-ABORT to the remote
         AE.
@@ -189,7 +189,7 @@ class Association(threading.Thread):
     @acse_timeout.setter
     def acse_timeout(self, value: Union[int, float, None]) -> None:
         """Set the ACSE timeout using numeric or ``None``."""
-        with self.lock:
+        async with self.lock:
             self.dul.artim_timer.timeout = value
             self._acse_timeout = value
 
@@ -223,7 +223,7 @@ class Association(threading.Thread):
             no extra arguments passed to the handler).
         """
         # Make sure no access to `_handlers` while its being changed
-        with self.lock:
+        async with self.lock:
             # Notification events - multiple handlers allowed
             if event.is_notification:
                 if event not in self._handlers:
@@ -491,6 +491,7 @@ class Association(threading.Thread):
         """Return ``True`` if the local AE is the association *requestor*."""
         return self.mode == MODE_REQUESTOR
 
+    # TODO: make async with dul
     def kill(self) -> None:
         """Kill the :class:`Association` thread."""
         # Ensure the reactor is running so it can be exited
@@ -509,8 +510,9 @@ class Association(threading.Thread):
 
         return self.requestor.info
 
+    # TODO: AE becomes async
     @property
-    def lock(self) -> threading.Lock:
+    def lock(self) -> asyncio.Lock:
         """Return the AE's :class:`threading.Lock`."""
         return self.ae._lock
 
@@ -562,6 +564,7 @@ class Association(threading.Thread):
         """
         return self._rejected_cx
 
+    # TODO: await for self._is_paused ideally
     def release(self) -> None:
         """Initiate association release by send an A-RELEASE request."""
         if self.is_established:
@@ -583,7 +586,7 @@ class Association(threading.Thread):
 
         return self.acceptor.info
 
-    def request(self) -> None:
+    async def request(self) -> None:
         """Request an association with a peer.
 
         A request can only be made once the :class:`Association` instance has
@@ -594,22 +597,22 @@ class Association(threading.Thread):
         self.dul.start()
         self._started_dul = True
         # Wait until the DUL is up and running
-        self._dul_ready.wait()
+        await self._dul_ready.wait()
         # Start association negotiation
         LOGGER.info("Requesting Association")
         self.acse.negotiate_association()
 
-    def run_reactor(self) -> None:
+    async def run_reactor(self) -> None:
         """The main :class:`Association` reactor."""
         # Start the DUL thread if not already started
         if not self._started_dul:
             self.dul.start()
             self._started_dul = True
             # Wait until the DUL is up and running
-            self._dul_ready.wait()
+            await self._dul_ready.wait()
 
         if self.is_acceptor:
-            primitive = self.dul.receive_pdu(
+            primitive = await self.dul.receive_pdu(
                 wait=True, timeout=self.acse_timeout
             )
 
@@ -641,7 +644,8 @@ class Association(threading.Thread):
             if self.is_established:
                 self._run_reactor()
 
-    def _run_reactor(self) -> None:
+    # TODO: no more time.sleep. everything waits
+    async def _run_reactor(self) -> None:
         """Run the ``Association`` acceptor reactor loop.
 
         Main acceptor run loop
@@ -659,7 +663,6 @@ class Association(threading.Thread):
         """
         self._is_paused = False
         while not self._kill:
-            time.sleep(0.001)
 
             # A race condition may occur if the Acceptor uses the send_*()
             #   methods as the received DIMSE message may be taken off the
@@ -669,12 +672,12 @@ class Association(threading.Thread):
             #   before attempting DIMSE or ACSE messaging
             # Will block until `_reactor_checkpoint` is set()
             self._is_paused = True
-            self._reactor_checkpoint.wait()
+            await self._reactor_checkpoint.wait()
             self._is_paused = False
 
             # Check with the DIMSE provider to see if a completely decoded
             #   message is available
-            context_id, msg = self.dimse.get_msg(block=False)
+            context_id, msg = await self.dimse.get_msg(block=False)
             if msg:
                 self._serve_request(msg, context_id)
 
@@ -696,7 +699,7 @@ class Association(threading.Thread):
                     msg += " (A-P-ABORT)"
                 LOGGER.info(msg)
                 # Ensure that EVT_ASCE_RECV fires for subscribers
-                self.dul.receive_pdu(wait=False)
+                await self.dul.receive_pdu(wait=False)
                 self.is_aborted = True
                 self.is_established = False
                 evt.trigger(self, evt.EVT_ABORTED, {})
@@ -710,13 +713,15 @@ class Association(threading.Thread):
                 return
 
             # Check if idle timer has expired
+            # TODO: consider moving to a future
             if self.dul.idle_timer_expired():
                 LOGGER.error("Network timeout reached")
                 self.abort()
                 self.kill()
                 return
 
-    def set_socket(self, socket: "AssociationSocket") -> None:
+    # TODO: what's an alternative to socket?
+    def set_stream(self, socket: "AssociationSocket") -> None:
         """Set the `socket` to use for communicating with the peer.
 
         Parameters
@@ -729,10 +734,10 @@ class Association(threading.Thread):
         RuntimeError
             If the :class:`Association` already has a socket set.
         """
-        if self.dul.socket is not None:
-            raise RuntimeError("The Association already has a socket set.")
+        if self.dul.stream is not None:
+            raise RuntimeError("The Association already has a stream set.")
 
-        self.dul.socket = socket
+        self.dul.stream = stream
 
     def unbind(self, event: evt.EventType, handler: Callable) -> None:
         """Unbind a callable `handler` from an `event`.

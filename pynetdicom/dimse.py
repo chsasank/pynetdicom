@@ -3,7 +3,7 @@ Implementation of the DIMSE service provider.
 """
 from io import BytesIO
 import logging
-import queue
+import asyncio
 import threading
 
 from pynetdicom import evt
@@ -146,7 +146,7 @@ class DIMSEServiceProvider:
 
         self.cancel_req = {}
         self.message = None
-        self.msg_queue = queue.Queue()
+        self.msg_queue = asyncio.Queue()
 
     @property
     def assoc(self):
@@ -166,7 +166,7 @@ class DIMSEServiceProvider:
         """Return the :class:`~pynetdicom.dul.DULServiceProvider`."""
         return self.assoc.dul
 
-    def get_msg(self, block=False):
+    async def get_msg(self, block=False):
         """Get the next available DIMSE message.
 
         .. versionadded:: 1.2
@@ -193,8 +193,14 @@ class DIMSEServiceProvider:
             period.
         """
         try:
-            return self.msg_queue.get(block=block, timeout=self.dimse_timeout)
-        except queue.Empty:
+            if block:
+                return await asyncio.wait_for(
+                    self.msg_queue.get(),
+                    timeout=self.dimse_timeout
+                )
+            else:
+                return self.msg_queue.get_nowait()
+        except(asyncio.QueueEmpty, asyncio.TimeoutError):
             return None, None
 
     @property

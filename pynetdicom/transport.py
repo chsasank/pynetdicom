@@ -231,7 +231,7 @@ class AssociationProtocol(asyncio.streams.StreamReaderProtocol):
             self._assoc, evt.EVT_CONN_OPEN, {'address' : self.remote}
         )
         self._server._active_connections.append(self)
-        await self._assoc.start()
+        await self._assoc.run_reactor()
 
     @property
     def ae(self):
@@ -532,7 +532,9 @@ class AssociationServer:
     async def serve_forever(self):
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            self, '127.0.0.1', 4242
+            protocol_factory=self,
+            host=self.address[0],
+            port=self.address[1]
         )
         async with server:
             await server.serve_forever()
